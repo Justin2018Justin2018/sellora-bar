@@ -5,7 +5,7 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const KSH = n => 'KSh ' + Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 2 });
-const TZO = 3; // East Africa Time: must match TZ_OFFSET_HOURS on the server
+let TZO = 3; // East Africa Time by default; replaced by the server's TZ_OFFSET_HOURS on every refresh so screen and reports always agree
 const today = () => new Date(Date.now() + TZO * 3600e3).toISOString().slice(0, 10);
 const addDays = (d, n) => new Date(Date.parse(d) + n * 864e5).toISOString().slice(0, 10);
 const dayOf = ts => new Date(Date.parse(ts) + TZO * 3600e3).toISOString().slice(0, 10);
@@ -13,7 +13,7 @@ const uid = p => p + '-' + Date.now().toString(36) + Math.random().toString(36).
 const ROLES = ['cashier', 'bartender', 'waiter', 'kitchen', 'receptionist', 'storekeeper', 'manager', 'admin'];
 const METHODS = ['Cash', 'M-Pesa', 'Card'];
 function newForm() { return { staff: '', table: 'Takeaway', method: 'Cash', cash: '', mpesa: '', bid: '', cust: '', later: false }; }
-let S = null, ME = null, AUTH = 'boot', TAB = 'dash', CART = [], ERR = '', R = {}, RF = today(), RT = today(), TOKEN = uid('t'), FORM = newForm(), BUSY = false, LASTERR = '';
+let S = null, ME = null, AUTH = 'boot', TAB = 'dash', CART = [], ERR = '', R = {}, RF = today(), RT = today(), TOKEN = uid('t'), FORM = newForm(), BUSY = false, LASTERR = '', NEEDKEY = false;
 const IDEM = {}; const idemFor = k => IDEM[k] || (IDEM[k] = uid('i'));
 
 /* ---------------------------------------------------------------- display mode (Auto / PC / Phone) */
@@ -51,13 +51,13 @@ async function act(fn, okMsg) { // one action at a time; errors become a visible
   catch (e) { LASTERR = e.message; if (!e.silent) toast(e.message, true); return false; }
   finally { BUSY = false; document.body.classList.remove('busy'); }
 }
-async function refresh() { S = await api('GET', '/api/state'); ME = S.me; }
+async function refresh() { S = await api('GET', '/api/state'); ME = S.me; if (typeof S.tz === 'number' && S.tz !== TZO) { TZO = S.tz; RF = RT = today(); } }
 const rep = (a, b) => api('GET', '/api/report?from=' + a + '&to=' + b);
 async function pre(t) { // reports needed by a tab
   R = {}; if (!can('reports')) return; const d = today();
   if (t === 'dash') { [R.d, R.w, R.m] = await Promise.all([rep(d, d), rep(addDays(d, -6), d), rep(d.slice(0, 8) + '01', d)]); }
   else if (t === 'fin') R.d = await rep(d, d);
-  else if (t === 'rep') R.r = await rep(RF, RT);
+  else if (t === 'rep') { R.r = await rep(RF, RT); R.k = (await api('GET', '/api/report/kegs?from=' + RF + '&to=' + RT)).kegs; }
 }
 const after = async () => { await refresh(); await pre(TAB); };
 async function run(fn, msg) { const ok = await act(async () => { await fn(); await after(); }, msg); render(); return ok; }
@@ -121,7 +121,7 @@ function render() {
   if (AUTH === 'setup') {
     A.innerHTML = `<div id="login" class="card"><h2>🍽️ Savanna Lodge POS</h2><p>Welcome. Create the owner account to get started. This screen only appears once.</p><form onsubmit="doSetup(event)">
  <p><label for="su">Username</label><br><input id="su" autocomplete="username" style="width:100%" required></p><p><label for="sn">Full name</label><br><input id="sn" style="width:100%" required></p>
- <p><label for="sp1">Password (8+ characters, not easy to guess)</label><br><input id="sp1" type="password" autocomplete="new-password" style="width:100%" required></p><p><label for="sp2">Repeat password</label><br><input id="sp2" type="password" autocomplete="new-password" style="width:100%" required></p>
+ ${NEEDKEY ? '<p><label for="sk">Setup key (from the SETUP_KEY setting on the server)</label><br><input id="sk" type="password" autocomplete="off" style="width:100%" required></p>' : ''}<p><label for="sp1">Password (8+ characters, not easy to guess)</label><br><input id="sp1" type="password" autocomplete="new-password" style="width:100%" required></p><p><label for="sp2">Repeat password</label><br><input id="sp2" type="password" autocomplete="new-password" style="width:100%" required></p>
  <button class="p" type="submit">Create owner account</button></form><p class="muted" id="le">${esc(ERR)}</p></div>`; return;
   }
   if (!ME) {
@@ -142,7 +142,7 @@ async function doLogin(e) {
 async function doSetup(e) {
   e.preventDefault(); const un = $('#su').value.trim(), nm = $('#sn').value.trim(), p1 = $('#sp1').value, p2 = $('#sp2').value;
   if (p1 !== p2) { $('#le').textContent = 'The two passwords do not match.'; return; }
-  const ok = await act(async () => { await api('POST', '/api/setup', { username: un, name: nm, password: p1 }); await api('POST', '/api/login', { username: un, password: p1 }); AUTH = 'app'; TAB = 'dash'; await after(); });
+  const ok = await act(async () => { await api('POST', '/api/setup', { username: un, name: nm, password: p1, setupKey: $('#sk') ? $('#sk').value : '' }); await api('POST', '/api/login', { username: un, password: p1 }); AUTH = 'app'; TAB = 'dash'; await after(); });
   if (!ok) { ERR = LASTERR; ME = null; AUTH = 'setup'; }
   render();
 }
@@ -208,9 +208,13 @@ async function submitSale(dept) {
   const ok = await act(async () => { const r = await api('POST', '/api/sale', body); id = r.id; await after(); });
   if (ok) { CART = []; FORM = newForm(); TOKEN = uid('t'); render(); receipt(id); } else if (ME) render();
 }
+const lineMoney = (qty, price) => (Math.round(qty * Math.round(price * 100)) / 100).toFixed(2); // same rounding as the server: cents, half up
+function receiptHtml(s) {
+  return `<pre style="font:13px monospace">SAVANNA LODGE\n${s.dept === 'bar' ? 'BAR' : 'RESTAURANT'} RECEIPT\n${esc(s.id)}\n${new Date(s.ts).toLocaleString()}\nSold By: ${esc(s.staffName)}${s.table ? '\nTable: ' + esc(s.table) : ''}\n------------------------\n${s.items.map(i => esc(i.name) + ' x' + i.qty + '  ' + lineMoney(i.qty, i.price)).join('\n')}\n------------------------\nTOTAL ${KSH(s.total)}\nPayment: ${esc(s.pay)}${live(s) ? '' : '\nSTATUS: ' + esc(s.status).toUpperCase()}</pre>`;
+}
 function receipt(id) { // printed through a hidden frame: no pop-up blocker problems
   const s = saleOf(id); if (!s) return;
-  const html = `<pre style="font:13px monospace">SAVANNA LODGE\n${s.dept === 'bar' ? 'BAR' : 'RESTAURANT'} RECEIPT\n${esc(s.id)}\n${new Date(s.ts).toLocaleString()}\nSold By: ${esc(s.staffName)}${s.table ? '\nTable: ' + esc(s.table) : ''}\n------------------------\n${s.items.map(i => esc(i.name) + ' x' + i.qty + '  ' + (i.qty * i.price)).join('\n')}\n------------------------\nTOTAL ${KSH(s.total)}\nPayment: ${esc(s.pay)}${live(s) ? '' : '\nSTATUS: ' + s.status.toUpperCase()}</pre>`;
+  const html = receiptHtml(s);
   const f = document.createElement('iframe'); f.style.cssText = 'position:fixed;width:0;height:0;border:0;right:0;bottom:0'; document.body.appendChild(f);
   f.contentDocument.open(); f.contentDocument.write('<!doctype html><title>Receipt</title>' + html); f.contentDocument.close();
   setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) { toast('Could not open the print dialog.', true); } setTimeout(() => f.remove(), 60000); }, 150);
@@ -249,7 +253,7 @@ function vRooms() {
     const f = b.folio, ch = S.charges.filter(c => c.bid === b.id), est = b.status === 'in' && f.est ? f.est : 0, bal = f.bal + est;
     return `<div class="card"><b>Room ${esc(b.room)} — ${esc(b.guest)}</b> <span class="tag">${b.status}</span> <span class="muted">${esc(b.in)} → ${esc(b.out)}${b.phone ? ' • ' + esc(b.phone) : ''}</span>
  <div class="tw"><table>${ch.map(c => `<tr><td>${esc(c.desc)}</td><td>${KSH(c.amount)}</td></tr>`).join('')}${est ? `<tr><td>Accommodation so far (${f.estNights} night(s), estimate)</td><td>${KSH(est)}</td></tr>` : ''}<tr><td>Payments received</td><td>${KSH(f.pa)}</td></tr><tr><th>Balance</th><th class="${bal > 0 ? 'bad' : 'ok'}">${KSH(bal)}</th></tr></table></div>
- ${b.status === 'reserved' ? `<button class="p" onclick="checkin('${b.id}')">Check in</button> ` : ''}${b.status === 'in' ? `<button class="p" onclick="checkout('${b.id}')">Check out</button> ` : ''}${['reserved', 'in', 'out'].includes(b.status) && can('pay') && !(b.status === 'out' && f.bal <= 0) ? `<button onclick="payFolio('${b.id}')">${b.status === 'reserved' ? 'Take deposit' : 'Take payment'}</button> ` : ''}${['reserved', 'in'].includes(b.status) ? `<button onclick="extend('${b.id}','${esc(b.out)}')">Change departure</button> ` : ''}${b.status === 'reserved' ? `<button class="d" onclick="cancelBooking('${b.id}')">Cancel booking</button>` : ''}</div>`;
+ ${b.status === 'reserved' ? `<button class="p" onclick="checkin('${b.id}')">Check in</button> ` : ''}${b.status === 'in' ? `<button class="p" onclick="checkout('${b.id}')">Check out</button> ` : ''}${['reserved', 'in', 'out'].includes(b.status) && can('pay') && !(b.status === 'out' && f.bal <= 0) ? `<button onclick="payFolio('${b.id}')">${b.status === 'reserved' ? 'Take deposit' : 'Take payment'}</button> ` : ''}${['reserved', 'in'].includes(b.status) ? `<button onclick="extend('${b.id}','${esc(b.out)}')">Change departure</button> ` : ''}${b.status === 'reserved' ? `<button class="d" onclick="cancelBooking('${b.id}')">Cancel booking</button>` : ''}${b.status === 'out' && f.bal < 0 && can('approve') ? `<button onclick="refundCredit('${b.id}')">Refund guest credit</button>` : ''}</div>`;
   }).join('') || '<p class="muted">No bookings yet.</p>'}</div>`;
 }
 const rstat = (no, st) => run(() => api('POST', '/api/room/status', { no, status: st }));
@@ -275,19 +279,25 @@ async function payFolio(id) {
   const k = 'folio|' + id + '|' + v.method + '|' + amt;
   if (await run(() => api('POST', '/api/room/pay', { bookingId: id, amount: amt, method: v.method, idem: idemFor(k) }), 'Payment recorded')) delete IDEM[k];
 }
+async function refundCredit(id) {
+  const b = S.bookings.find(x => x.id === id), credit = -b.folio.bal;
+  const v = await form('Refund guest credit — Room ' + b.room + ' (' + b.guest + ')', [{ note: 'Credit held: ' + KSH(credit) }, { key: 'amount', label: 'Amount to refund (KSh)', type: 'number', value: credit, required: true }, { key: 'method', label: 'Paid back by', options: METHODS.map(m => [m, m]) }], 'Refund');
+  if (!v) return; const amt = Number(v.amount); if (!(amt > 0) || amt > credit + 0.009) return toast('Invalid amount.', true);
+  const k = 'frefund|' + id + '|' + v.method + '|' + amt; if (await run(() => api('POST', '/api/room/refund', { bookingId: id, amount: amt, method: v.method, idem: idemFor(k) }), 'Refund recorded')) delete IDEM[k];
+}
 async function extend(id, cur) { const v = await form('Change departure date', [{ key: 'out', label: 'New departure date', type: 'date', value: cur, required: true }]); if (v) run(() => api('POST', '/api/room/extend', { bookingId: id, out: v.out }), 'Departure changed'); }
 async function cancelBooking(id) { const v = await form('Cancel booking', [{ note: 'Any deposit taken will be refunded.' }, { key: 'reason', label: 'Reason (required)', required: true }], 'Cancel booking'); if (v) run(() => api('POST', '/api/room/cancel', { bookingId: id, reason: v.reason }), 'Booking cancelled'); }
 
 /* ---------------------------------------------------------------- stock */
 function vStock() {
-  const items = S.products.filter(p => p.active || p.stock), order = ['Spirits', 'Beer', 'Soft', 'Food', 'Drinks', 'Ingredient'];
+  const items = S.products.filter(p => p.active || p.stock || can('price')), order = ['Spirits', 'Beer', 'Soft', 'Food', 'Drinks', 'Ingredient'];
   const cats = [...new Set(items.map(p => p.cat || 'Uncategorised'))].sort((x, y) => { const i = order.indexOf(x), j = order.indexOf(y); return (i < 0 ? 99 : i) - (j < 0 ? 99 : j) || x.localeCompare(y); });
-  const row = p => `<tr><td>${esc(p.name)}${p.active ? '' : ' <span class="muted">(retired)</span>'}${p.recipe ? ' <span class="tag">recipe</span>' : ''}</td><td>${p.dept}</td><td class="${p.stock <= p.reorder ? 'wn' : ''}">${p.stock}</td><td>${KSH(p.cost)}</td><td>${p.price > 0 ? KSH(p.price) : '<span class="wn">not set</span>'}</td><td>${can('price') ? `<button onclick="editProd('${p.id}')">Edit</button> ` : ''}${can('stock') ? `<button onclick="recv('${p.id}')">Receive</button> <button onclick="adj('${p.id}')">Adjust</button> ` : ''}${can('price') && p.dept === 'rest' ? `<button onclick="recipe('${p.id}')">Recipe</button>` : ''}</td></tr>`;
-  return `<div class="card"><h3>Stock register</h3><div class="muted">Grouped by category — tap a heading to collapse it.</div>${can('price') ? '<p><button class="p" onclick="newItem()">Add item</button></p>' : ''}${items.length ? '' : `<p>No items yet.${ME.role === 'admin' ? ' Add items here, or load the starter menu from the Users tab.' : ''}</p>`}</div>`
+  const row = p => `<tr><td>${esc(p.name)}${p.active ? '' : ' <span class="muted">(retired)</span>'}${p.recipe ? ' <span class="tag">recipe</span>' : ''}</td><td>${p.dept}</td><td class="${p.stock <= p.reorder ? 'wn' : ''}">${p.stock}${p.packSize ? ' L' : ''}</td><td>${KSH(p.cost)}</td><td>${p.price > 0 ? KSH(p.price) : '<span class="wn">not set</span>'}</td><td>${can('price') ? `<button onclick="editProd('${p.id}')">Edit</button> ` : ''}${can('stock') ? (p.packSize ? `<button onclick="recvKeg('${p.id}')">Receive keg</button> ` : `<button onclick="recv('${p.id}')">Receive</button> `) + `<button onclick="adj('${p.id}')">Adjust</button> ` : ''}${can('price') && p.dept !== 'store' ? `<button onclick="recipe('${p.id}')">Recipe</button> ` : ''}${can('price') ? `<button onclick="archive('${p.id}',${p.active ? 'false' : 'true'})">${p.active ? 'Retire' : 'Restore'}</button>` : ''}</td></tr>`;
+  return `<div class="card"><h3>Stock register</h3><div class="muted">Grouped by category — tap a heading to collapse it.</div>${can('price') ? '<p><button class="p" onclick="newItem()">Add item</button> <button onclick="kegSetup()">Set up a keg (litre sales)</button></p>' : ''}${items.length ? '' : `<p>No items yet.${ME.role === 'admin' ? ' Add items here, or load the starter menu from the Users tab.' : ''}</p>`}</div>`
     + cats.map(c => { const L = items.filter(p => (p.cat || 'Uncategorised') === c), low = L.filter(p => p.stock <= p.reorder).length;
       return `<details open class="card"><summary><b>${esc(c)}</b> <span class="tag">${L.length} items</span>${low ? ` <span class="tag wn">${low} low</span>` : ''}</summary><div class="tw"><table><tr><th>Item</th><th>Dept</th><th>Stock</th><th>Cost</th><th>Price</th><th></th></tr>${L.map(row).join('')}</table></div></details>`; }).join('')
     + `<div class="card"><h3>Price &amp; item change history</h3><div class="tw"><table><tr><th>When</th><th>Who</th><th>Item</th><th>Change</th><th>Reason</th></tr>${S.priceLog.slice(0, 30).map(h => `<tr><td>${new Date(h.ts).toLocaleString()}</td><td>${esc(h.user)}</td><td>${esc(h.item)}</td><td>${h.changes.map(c => esc(c.field) + ': ' + esc(c.from) + ' → ' + esc(c.to)).join('<br>')}</td><td>${esc(h.reason)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">No changes yet.</td></tr>'}</table></div></div>
- <div class="card"><h3>Movement history</h3><div class="tw"><table><tr><th>Time</th><th>Item</th><th>Qty</th><th>Reason</th><th>User</th></tr>${S.moves.slice(0, 25).map(m => `<tr><td>${new Date(m.ts).toLocaleString()}</td><td>${esc((prod(m.pid) || {}).name || m.pid)}</td><td>${m.qty}</td><td>${esc(m.reason)}</td><td>${esc(m.user)}</td></tr>`).join('')}</table></div></div>`;
+ <div class="card"><h3>Movement history</h3><div class="tw"><table><tr><th>Time</th><th>Item</th><th>Qty</th><th>Reason</th><th>Sale / ref</th><th>User</th></tr>${S.moves.slice(0, 25).map(m => `<tr><td>${new Date(m.ts).toLocaleString()}</td><td>${esc((prod(m.pid) || {}).name || m.pid)}</td><td>${m.qty}${(prod(m.pid) || {}).packSize ? ' L' : ''}</td><td>${esc(m.reason)}</td><td>${esc(m.ref)}</td><td>${esc(m.user)}</td></tr>`).join('')}</table></div></div>`;
 }
 async function newItem() {
   const v = await form('Add item', [{ key: 'name', label: 'Name', required: true }, { key: 'dept', label: 'Where it is sold', options: [['bar', 'Bar'], ['rest', 'Restaurant'], ['store', 'Store only (ingredient)']] }, { key: 'cat', label: 'Category (e.g. Beer, Spirits, Soft, Food, Ingredient)', required: true }, { key: 'price', label: 'Selling price (KSh)', type: 'number', value: 0 }, { key: 'cost', label: 'Buying cost (KSh)', type: 'number', value: 0 }, { key: 'reorder', label: 'Reorder level', type: 'number', value: 5 }]);
@@ -295,7 +305,8 @@ async function newItem() {
 }
 async function editProd(id) {
   const p = prod(id);
-  const v = await form('Edit: ' + p.name, [{ key: 'price', label: 'Selling price (KSh)', type: 'number', value: p.price, required: true }, { key: 'cost', label: 'Buying cost (KSh)', type: 'number', value: p.cost, required: true }, { key: 'reorder', label: 'Reorder level', type: 'number', value: p.reorder, required: true }, { key: 'cat', label: 'Category', value: p.cat, required: true }, { key: 'reason', label: 'Reason for change (required for price/cost)' }, { key: 'pw', label: 'Confirm with YOUR password (' + ME.name + ')', type: 'password', required: true }, { note: 'Every change is recorded with your name, the time, old and new values and your reason. It cannot be deleted.' }], 'Save change');
+  const opt = p.priceOpts && ME.role === 'admin', fixed = p.priceOpts && ME.role !== 'admin';
+  const v = await form('Edit: ' + p.name, [(opt ? { key: 'price', label: 'Selling price (administrator choice)', options: p.priceOpts.map(x => [x, KSH(x)]), value: p.price } : { key: 'price', label: 'Selling price (KSh)' + (fixed ? ' — only the administrator can change this one' : ''), type: 'number', value: p.price, required: true }), { key: 'cost', label: 'Buying cost (KSh)', type: 'number', value: p.cost, required: true }, { key: 'reorder', label: 'Reorder level', type: 'number', value: p.reorder, required: true }, { key: 'cat', label: 'Category', value: p.cat, required: true }, { key: 'reason', label: 'Reason for change (required for price/cost)' }, { key: 'pw', label: 'Confirm with YOUR password (' + ME.name + ')', type: 'password', required: true }, { note: 'Every change is recorded with your name, the time, old and new values and your reason. It cannot be deleted.' }], 'Save change');
   if (!v) return; const pr = Number(v.price), co = Number(v.cost);
   if ((pr !== p.price || co !== p.cost) && !v.reason.trim()) return toast('Please give a reason for the price/cost change.', true);
   if ((pr !== p.price || co !== p.cost) && pr > 0 && co > pr && !confirm('Cost is higher than price — save anyway?')) return;
@@ -303,16 +314,34 @@ async function editProd(id) {
 }
 async function recv(id) {
   const p = prod(id), v = await form('Receive stock: ' + p.name, [{ key: 'qty', label: 'Quantity received', type: 'number', required: true }, { key: 'cost', label: 'Unit purchase cost (KSh)', type: 'number', value: p.cost, required: true }], 'Receive');
-  if (v && Number(v.qty) > 0) run(() => api('POST', '/api/stock/receive', { pid: id, qty: Number(v.qty), cost: Number(v.cost) }), 'Stock received'); else if (v) toast('Quantity must be above zero.', true);
+  if (v && Number(v.qty) > 0) { const k = 'recv|' + id + '|' + v.qty + '|' + v.cost; if (await run(() => api('POST', '/api/stock/receive', { pid: id, qty: Number(v.qty), cost: Number(v.cost), idem: idemFor(k) }), 'Stock received')) delete IDEM[k]; } else if (v) toast('Quantity must be above zero.', true);
 }
 async function adj(id) {
   const p = prod(id), v = await form('Adjust stock: ' + p.name, [{ note: 'System shows ' + p.stock + '. Count what is physically on the shelf.' }, { key: 'counted', label: 'Counted quantity', type: 'number', required: true }, { key: 'kind', label: 'Type', options: [['count', 'Stock-take correction'], ['waste', 'Wastage / breakage']] }, { key: 'reason', label: 'Reason (required)', required: true }], 'Save count');
-  if (v) run(() => api('POST', '/api/stock/adjust', { pid: id, counted: Number(v.counted), wastage: v.kind === 'waste', reason: v.reason }), 'Stock adjusted');
+  if (v) { const k = 'adj|' + id + '|' + v.counted + '|' + v.kind + '|' + v.reason; if (await run(() => api('POST', '/api/stock/adjust', { pid: id, counted: Number(v.counted), wastage: v.kind === 'waste', reason: v.reason, idem: idemFor(k) }), 'Stock adjusted')) delete IDEM[k]; }
+}
+async function archive(id, active) {
+  const p = prod(id), v = await form((active ? 'Restore: ' : 'Retire: ') + p.name, [{ note: active ? 'The item can be sold again.' : 'The item disappears from the sales screens. Its history stays.' }, { key: 'pw', label: 'Confirm with YOUR password (' + ME.name + ')', type: 'password', required: true }], active ? 'Restore' : 'Retire');
+  if (v) run(() => api('POST', '/api/product/archive', { id, active, password: v.pw }), active ? 'Item restored' : 'Item retired');
+}
+async function kegSetup() {
+  const v = await form('Set up a keg (sold by the litre)', [{ note: 'Creates ONE stock item counted in litres, plus the serving sizes the cashier will tap. Costs come from the keg price: cost per litre = keg price / capacity.' },
+    { key: 'name', label: 'Keg item name', value: 'Tusker Lager (keg)', required: true }, { key: 'size', label: 'Keg capacity (litres)', type: 'number', value: 50, required: true }, { key: 'packCost', label: 'Keg purchase price (KSh)', type: 'number', value: 5358, required: true },
+    { key: 'gn', label: 'Glass name', value: 'Tusker Glass 500 ml', required: true }, { key: 'gml', label: 'Glass size (ml)', type: 'number', value: 500, required: true }, { key: 'gp', label: 'Glass price (KSh)', type: 'number', value: 70, required: true },
+    { key: 'jn', label: 'Jug name', value: 'Tusker Jug 1500 ml', required: true }, { key: 'jml', label: 'Jug size (ml)', type: 'number', value: 1500, required: true }, { key: 'jp', label: 'Jug starting price (KSh)', type: 'number', value: 210, required: true }, { key: 'jo', label: 'Jug price choices (KSh, comma separated; leave empty for a free price)', value: '210,250' }], 'Create keg');
+  if (!v) return; const opts = String(v.jo || '').split(',').map(x => x.trim()).filter(Boolean).map(Number); if (opts.some(x => !(x > 0))) return toast('Price choices must be numbers above zero.', true);
+  const jug = { name: v.jn, ml: Number(v.jml), price: Number(v.jp) }; if (opts.length) jug.options = opts;
+  run(() => api('POST', '/api/keg/setup', { name: v.name, size: Number(v.size), packCost: Number(v.packCost), servings: [{ name: v.gn, ml: Number(v.gml), price: Number(v.gp) }, jug] }), 'Keg created. Now use "Receive keg" to add the first keg.');
+}
+async function recvKeg(id) {
+  const p = prod(id), v = await form('Receive keg: ' + p.name, [{ note: 'One keg = ' + p.packSize + ' litres. Remaining now: ' + p.stock + ' L.' }, { key: 'kegs', label: 'Number of kegs received', type: 'number', value: 1, required: true }, { key: 'packCost', label: 'Price per keg (KSh)', type: 'number', value: p.packCost == null ? '' : p.packCost, required: true }], 'Receive');
+  if (!v || !(Number(v.kegs) > 0)) return; const k = 'kegrecv|' + id + '|' + v.kegs + '|' + v.packCost;
+  if (await run(() => api('POST', '/api/keg/receive', { pid: id, kegs: Number(v.kegs), packCost: Number(v.packCost), idem: idemFor(k) }), 'Keg received')) delete IDEM[k];
 }
 async function recipe(id) {
   const p = prod(id), ings = S.products.filter(x => x.id !== id && x.dept === 'store'), cur = p.recipe || [], N = 5, f = [{ note: 'What one ' + p.name + ' uses from the store. Leave unused rows empty. Selling it will take these from stock instead.' }];
   if (!ings.length) return toast('Add ingredients first (an item with "Store only" selected).', true);
-  for (let i = 0; i < N; i++) { f.push({ key: 'i' + i, label: 'Ingredient ' + (i + 1), options: [['', '—']].concat(ings.map(x => [x.id, x.name])), value: cur[i] ? cur[i].pid : '' }, { key: 'q' + i, label: 'Quantity ' + (i + 1), type: 'number', value: cur[i] ? cur[i].qty : '' }); }
+  for (let i = 0; i < N; i++) { f.push({ key: 'i' + i, label: 'Ingredient ' + (i + 1), options: [['', '—']].concat(ings.map(x => [x.id, x.name])), value: cur[i] ? cur[i].pid : '' }, { key: 'q' + i, label: 'Quantity ' + (i + 1) + ' (litres for a keg: 500 ml = 0.5)', type: 'number', value: cur[i] ? cur[i].qty : '' }); }
   const v = await form('Recipe: ' + p.name, f); if (!v) return; const list = [];
   for (let i = 0; i < N; i++) if (v['i' + i]) { const q = Number(v['q' + i]); if (!(q > 0)) return toast('Give a quantity for each ingredient chosen.', true); list.push({ pid: v['i' + i], qty: q }); }
   run(() => api('POST', '/api/product/recipe', { id, ingredients: list }), 'Recipe saved');
@@ -326,7 +355,7 @@ function vFin() {
  ${can('shift') ? vShift() : ''}<div class="card"><h3>Add expense</h3><div class="row"><div><label for="e_c">Category</label><select id="e_c"><option>Utilities</option><option>Salaries</option><option>Supplies</option><option>Repairs</option><option>Other</option></select></div><div><label for="e_d">Description / ref</label><input id="e_d"></div><div><label for="e_a">Amount</label><input id="e_a" type="number" min="0"></div><button class="p" onclick="addExp()">Save</button></div></div>
  <div class="card"><h3>Expenses</h3><div class="tw"><table><tr><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th>By</th></tr>${S.expenses.slice(0, 100).map(e => `<tr><td>${dayOf(e.ts)}</td><td>${esc(e.cat)}</td><td>${esc(e.desc)}</td><td>${KSH(e.amount)}</td><td>${esc(e.user)}</td></tr>`).join('')}</table></div></div>`;
 }
-function addExp() { const a = Number($('#e_a').value), d = $('#e_d').value.trim(); if (!(a > 0) || !d) return toast('Description and an amount above zero are required.', true); run(() => api('POST', '/api/expense', { cat: $('#e_c').value, desc: d, amount: a }), 'Expense saved'); }
+function addExp() { const a = Number($('#e_a').value), d = $('#e_d').value.trim(); if (!(a > 0) || !d) return toast('Description and an amount above zero are required.', true); const c = $('#e_c').value, k = 'exp|' + c + '|' + d + '|' + a; run(() => api('POST', '/api/expense', { cat: c, desc: d, amount: a, idem: idemFor(k) }), 'Expense saved').then(ok => { if (ok) delete IDEM[k]; }); }
 const openShift = async () => { const v = await form('Open shift', [{ key: 'float', label: 'Opening cash float (KSh)', type: 'number', value: 0, required: true }], 'Open shift'); if (v) run(() => api('POST', '/api/shift/open', { float: Number(v.float) }), 'Shift opened'); };
 async function closeShift() {
   const v = await form('Close shift', [{ note: 'Count the cash drawer. The system works out what it should hold.' }, { key: 'counted', label: 'Cash counted (KSh)', type: 'number', required: true }], 'Close shift'); if (!v) return;
@@ -340,12 +369,17 @@ function vRep() {
   return `<div class="card row"><div><label for="rf">From</label><input type="date" id="rf" value="${RF}"></div><div><label for="rt">To</label><input type="date" id="rt" value="${RT}"></div><button class="p" onclick="applyRange()">Apply</button><button onclick="csv()">Export sales CSV</button><button onclick="window.print()">Print</button></div>
  <div class="grid">${kpi('Revenue', KSH(d.rv))}${kpi('Gross profit', KSH(d.gp))}${kpi('Expenses', KSH(d.exp))}${kpi('Net profit', KSH(d.np), d.np < 0 ? 'bad' : 'ok')}${kpi('Outstanding', KSH(d.out), d.out ? 'wn' : '')}${kpi('Deposits held', KSH(d.deposits))}${kpi('Stock value (at cost)', KSH(d.stockValue))}</div>
  <div class="card"><h3>By department</h3>Bar ${KSH(d.rev.bar)} • Restaurant ${KSH(d.rev.rest)} • Lodging ${KSH(d.rev.lodging)}<h3>By salesperson</h3>${Object.entries(d.bySalesperson).map(([k, v]) => `<div>${esc(k)}: ${KSH(v)}</div>`).join('') || '-'}<h3>By payment method</h3>${Object.entries(d.pm).map(([k, v]) => `<div>${esc(k)}: ${KSH(v)}</div>`).join('') || '-'}<h3>Outstanding</h3><div>Open bills and credit: ${KSH(d.outSales)}</div><div>Guest folios: ${KSH(d.outBookings)}</div></div>
+${(R.k || []).map(k => `<div class="card"><h3>🍺 ${esc(k.name)} — litres report</h3><div class="grid">${kpi('Keg capacity', k.capacity + ' L')}${kpi('Keg purchase cost', KSH(k.kegCost))}${kpi('Cost per litre', KSH(k.costPerLitre))}${kpi('Litres sold (period)', k.period.litresSold + ' L')}${kpi('Remaining now', k.remaining + ' L', k.remaining <= 0 ? 'bad' : '')}${kpi('Revenue', KSH(k.period.revenue))}${kpi('Cost of litres sold', KSH(k.period.cost))}${kpi('Gross profit', KSH(k.period.grossProfit), k.period.grossProfit < 0 ? 'bad' : 'ok')}</div>
+ <div class="tw"><table><tr><th>Serving</th><th>Sold</th><th>Litres</th><th>Revenue</th><th>Cost</th></tr>${k.period.servings.map(x => `<tr><td>${esc(x.name)}</td><td>${x.qty}</td><td>${x.litres} L</td><td>${KSH(x.revenue)}</td><td>${KSH(x.cost)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">No sales in this period.</td></tr>'}</table></div>
+ <p class="muted">All time: received ${k.lifetime.received} L − sold ${k.lifetime.sold} L ${k.lifetime.adjusted < 0 ? '−' : '+'} adjustments ${Math.abs(k.lifetime.adjusted)} L = ${k.lifetime.remaining} L remaining ${k.lifetime.reconciled ? '<b class="ok">✓ reconciled</b>' : '<b class="bad">✗ does not reconcile — investigate</b>'}</p></div>`).join('')}
  <div class="card"><h3>Audit log</h3><div class="tw"><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>${S.audit.slice(0, 40).map(a => `<tr><td>${new Date(a.ts).toLocaleString()}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join('')}</table></div></div>`;
 }
 async function applyRange() { const a = $('#rf').value, b = $('#rt').value; if (!a || !b || b < a) return toast('Choose a valid date range.', true); RF = a; RT = b; await run(async () => { }); }
-function csv() {
-  const rows = [['ref', 'time', 'dept', 'sold_by', 'total', 'status', 'payment']].concat(S.sales.filter(s => dayOf(s.ts) >= RF && dayOf(s.ts) <= RT).map(s => [s.id, s.ts, s.dept, s.staffName, s.total, s.status, s.pay]));
-  download(new Blob([rows.map(r => r.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\n')], { type: 'text/csv' }), 'sales.csv'); toast('Covers the latest 500 sales. For everything, use the full backup on the Users tab.');
+async function csv() { // the full range comes from the server, so the file always matches the report on screen
+  const a = RF, b = RT; let d; if (!(await act(async () => { d = await api('GET', '/api/report/sales?from=' + a + '&to=' + b); }))) return;
+  const cell = c => { let t = String(c == null ? '' : c); if (typeof c === 'string' && /^[=+\-@\t\r]/.test(t)) t = "'" + t; return '"' + t.replace(/"/g, '""') + '"'; }; // a leading = + - @ would be run as a formula by Excel
+  const rows = [['ref', 'time', 'day', 'dept', 'sold_by', 'recorded_by', 'customer', 'payment', 'status', 'total']].concat(d.rows.map(r => [r.id, r.ts, r.day, r.dept, r.soldBy, r.recordedBy, r.customer, r.pay, r.status, r.total]));
+  download(new Blob([rows.map(r => r.map(cell).join(',')).join('\n')], { type: 'text/csv' }), 'sales-' + a + '-to-' + b + '.csv'); toast('Exported ' + d.rows.length + ' sales (' + a + ' to ' + b + ').');
 }
 
 /* ---------------------------------------------------------------- users, backup, data loading (admin) */
@@ -395,9 +429,10 @@ function importOld(inp) {
 /* ---------------------------------------------------------------- start */
 async function boot() {
   render();
-  try { const st = await api('GET', '/api/status'); if (st.needsSetup) { AUTH = 'setup'; render(); return; } }
+  let signedIn = false;
+  try { const st = await api('GET', '/api/status'); signedIn = !!st.signedIn; NEEDKEY = !!st.needsKey; if (st.needsSetup) { AUTH = 'setup'; render(); return; } }
   catch (e) { AUTH = 'login'; ERR = e.message; render(); return; }
-  try { await refresh(); await pre(TAB); } catch (e) { ME = null; }
+  try { if (signedIn) { await refresh(); await pre(TAB); } } catch (e) { ME = null; }
   AUTH = ME ? 'app' : 'login'; render();
 }
 boot();
